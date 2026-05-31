@@ -1,0 +1,20 @@
+{
+  "name": "robo-meister/context-engine-api",
+  "description": "PHP SDK for Context Engine (CE)",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "ContextEngine\\": "./"
+    },
+    "files": [
+      "ContextEngineClient.php",
+      "ContextEngineRedisClient.php"
+    ]
+  }
+}
