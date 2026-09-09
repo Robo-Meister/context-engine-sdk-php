@@ -8,6 +8,14 @@
     "ext-curl": "*",
     "ext-json": "*"
   },
+  "scripts": {
+    "test": [
+      "@php tests/context_engine_client_test.php",
+      "@php tests/scoped_client_test.php",
+      "@php tests/redis_client_test.php"
+    ],
+    "test:server": "@php tests/server_smoke.php"
+  },
   "autoload": {
     "psr-4": {
       "ContextEngine\\": "./"

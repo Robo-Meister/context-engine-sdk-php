@@ -23,16 +23,41 @@ class ContextEngineRedisClient
     private string $responsePrefix;
     private string $greetingKey;
     private float $responseTimeout;
+    private $responseWriter;
+    private int $responseTtlSeconds;
 
     public function __construct(
         $redisClient,
         string $requestChannel = 'context_engine:requests',
         string $responsePrefix = 'context_engine:response:',
         string $greetingKey = 'context_engine:greeting',
-        float $responseTimeout = 5.0
+        float $responseTimeout = 5.0,
+        $responseWriter = null,
+        int $responseTtlSeconds = 300,
+        string $eventsStreamKey = 'ce:events'
     ) {
         if ($redisClient === null) {
             throw new RuntimeException('redisClient is required');
+        }
+
+        if (!is_finite($responseTimeout) || $responseTimeout <= 0 || $responseTtlSeconds <= 0) {
+            throw new RuntimeException('Redis timeouts and response TTL must be positive');
+        }
+        foreach ([$requestChannel, $responsePrefix, $greetingKey, $eventsStreamKey] as $name) {
+            if ($name === '' || preg_match('/[\x00-\x20\x7f]/', $name)) {
+                throw new RuntimeException('Redis namespaces must be non-empty and contain no whitespace');
+            }
+        }
+        foreach ([$requestChannel, $responsePrefix, $greetingKey] as $name) {
+            if ($name === $eventsStreamKey || str_starts_with($name, $eventsStreamKey . ':')
+                || in_array($name, ['ce:events', 'ce:deadletter'], true)
+                || preg_match('/\Ace:(events|record|mutation|tombstone):/', $name)) {
+                throw new RuntimeException('Request/reply and greeting namespaces must not use CE event or state keys');
+            }
+        }
+        if ($requestChannel === $greetingKey || str_starts_with($greetingKey, $responsePrefix)
+            || str_starts_with($eventsStreamKey, $responsePrefix)) {
+            throw new RuntimeException('Redis request/reply namespaces overlap');
         }
 
         $this->redis = $redisClient;
@@ -40,6 +65,8 @@ class ContextEngineRedisClient
         $this->responsePrefix = $responsePrefix;
         $this->greetingKey = $greetingKey;
         $this->responseTimeout = $responseTimeout;
+        $this->responseWriter = $responseWriter;
+        $this->responseTtlSeconds = $responseTtlSeconds;
     }
 
     /**
@@ -59,6 +86,9 @@ class ContextEngineRedisClient
         */
     public function sendRequest(array $payload, bool $waitForResponse = false, ?float $timeout = null): mixed
     {
+        if ($timeout !== null && (!is_finite($timeout) || $timeout <= 0)) {
+            throw new RuntimeException('timeout must be positive');
+        }
         $requestId = bin2hex(random_bytes(8));
         $responseKey = $this->responsePrefix . $requestId;
 
@@ -86,6 +116,12 @@ class ContextEngineRedisClient
      */
     public function handleRequests(callable $handler, ?int $stopAfter = null): int
     {
+        if ($this->responseWriter === null || $this->responseWriter === $this->redis) {
+            throw new RuntimeException('handleRequests requires a separate responseWriter connection');
+        }
+        if ($stopAfter !== null && $stopAfter <= 0) {
+            throw new RuntimeException('stopAfter must be positive');
+        }
         $processed = 0;
         $channel = $this->requestChannel;
 
@@ -99,9 +135,16 @@ class ContextEngineRedisClient
             $responseKey = is_array($decoded) && isset($decoded['response_key']) ? $decoded['response_key'] : null;
             $requestId = is_array($decoded) && isset($decoded['id']) ? $decoded['id'] : null;
 
+            if ($responseKey !== null) {
+                if (!is_string($responseKey) || !str_starts_with($responseKey, $this->responsePrefix)
+                    || !preg_match('/\A[a-f0-9]{16}\z/', substr($responseKey, strlen($this->responsePrefix)))) {
+                    throw new RuntimeException('Invalid response key');
+                }
+            }
             $response = $handler($payload, $requestId, $responseKey);
             if ($responseKey !== null) {
-                $this->redis->set($responseKey, $this->encodeMessage($response));
+                $written = $this->responseWriter->setex($responseKey, $this->responseTtlSeconds, $this->encodeMessage($response));
+                if ($written === false) throw new RuntimeException('Redis response write failed');
             }
 
             $processed++;
@@ -120,14 +163,16 @@ class ContextEngineRedisClient
     /** Store a greeting or similar static value in Redis. */
     public function setGreeting(string $value): void
     {
-        $this->redis->set($this->greetingKey, $value);
+        if ($this->redis->set($this->greetingKey, $value) === false) {
+            throw new RuntimeException('Redis greeting write failed');
+        }
     }
 
     /** Retrieve the configured greeting value. */
     public function getGreeting(): ?string
     {
         $value = $this->redis->get($this->greetingKey);
-        if ($value === null) {
+        if ($value === null || $value === false) {
             return null;
         }
         if (is_string($value)) {
@@ -149,7 +194,9 @@ class ContextEngineRedisClient
             throw new RuntimeException('Redis client must support publish');
         }
 
-        $this->redis->publish($channel, $encoded);
+        if ($this->redis->publish($channel, $encoded) === false) {
+            throw new RuntimeException('Redis publish failed');
+        }
     }
 
     private function waitForResponse(string $key, ?float $timeout): mixed
@@ -159,7 +206,7 @@ class ContextEngineRedisClient
 
         while (microtime(true) < $deadline) {
             $value = $this->redis->get($key);
-            if ($value !== null) {
+            if ($value !== null && $value !== false) {
                 return $this->decodeMessage($value);
             }
 
@@ -193,10 +240,6 @@ class ContextEngineRedisClient
 
     private function encodeMessage($value): string
     {
-        if (is_scalar($value)) {
-            return (string) $value;
-        }
-
         try {
             return json_encode($value, JSON_THROW_ON_ERROR);
         } catch (JsonException $e) {
